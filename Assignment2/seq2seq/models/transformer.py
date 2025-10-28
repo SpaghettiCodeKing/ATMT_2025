@@ -110,7 +110,7 @@ class EncoderBlock(nn.Module):
     '''EncoderBlock: self-attention -> position-wise fully connected feed-forward layer'''
     def __init__(self, dim_embed, dropout, n_heads, dim_ff):
         super(EncoderBlock, self).__init__()
-        self.atten = MultiHeadedAttention(n_heads, dim_embed, dropout)
+        self.atten = MultiHeadedAttention(n_heads, dim_embed, dropout, num_kv_heads=1)
         self.feed_forward = nn.Sequential(
             nn.Linear(dim_embed, dim_ff),
             nn.ReLU(),
@@ -175,47 +175,54 @@ class TransformerDecoder(Seq2SeqDecoder):
         return logits
 
 class MultiHeadedAttention(nn.Module):
-    def __init__(self, n_heads: int, dim_embed: int, dropout: float = 0.0):
+    def __init__(self, n_heads: int, dim_embed: int, dropout: float = 0.0, num_kv_heads: int = 1):
         super(MultiHeadedAttention, self).__init__()
         #super().__init__()  python 3.x
-        assert dim_embed % n_heads == 0 # check the h number
-        self.d_k = dim_embed//n_heads
-        self.dim_embed = dim_embed    # 512
-        self.h = n_heads  # 8
+        assert dim_embed % n_heads == 0
+        self.hq = n_heads                 # query heads (H)
+        self.hk = num_kv_heads            # kv heads (G)  -> MQA => 1
+        self.d_k = dim_embed // n_heads   # head dim
+        self.dim_embed = dim_embed
+
         self.WQ = nn.Linear(dim_embed, dim_embed)
-        self.WK = nn.Linear(dim_embed, dim_embed)
-        self.WV = nn.Linear(dim_embed, dim_embed) 
+
+        # K,V project only to G*d_k (G <= H). For MQA, G=1 so out_dim = d_k
+        self.WK = nn.Linear(dim_embed, self.hk * self.d_k)
+        self.WV = nn.Linear(dim_embed, self.hk * self.d_k)
+
         self.linear = nn.Linear(dim_embed, dim_embed)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x_query, x_key, x_value, mask=None):
-        nbatch = x_query.size(0) # get batch size
-        # 1) Linear projections to get the multi-head query, key and value tensors
-        # x_query, x_key, x_value dimension: nbatch * seq_len * dim_embed
-        # LHS query, key, value dimensions: nbatch * h * seq_len * d_k
-        query = self.WQ(x_query).view(nbatch, -1, self.h, self.d_k).transpose(1,2)
-        key   = self.WK(x_key).view(nbatch, -1, self.h, self.d_k).transpose(1,2)
-        value = self.WV(x_value).view(nbatch, -1, self.h, self.d_k).transpose(1,2)
-        # 2) Attention
-        # scores has dimensions: nbatch * h * seq_len * seq_len
-        scores = torch.matmul(query, key.transpose(-2, -1))/math.sqrt(self.d_k)
-        # 3) Mask out padding tokens and future tokens
-        if mask is not None:
-            mask.unsqueeze(dim=1)
+        B, Tq = x_query.size(0), x_query.size(1)
+        Tk = x_key.size(1)
+        # Q: [B, H, Tq, d_k]
+        Q = self.WQ(x_query).view(B, Tq, self.hq, self.d_k).transpose(1, 2)
 
-            scores = scores.masked_fill(mask, float('-inf'))
-        # p_atten dimensions: nbatch * h * seq_len * seq_len
-        p_atten = torch.nn.functional.softmax(scores, dim=-1) # attention filter
-        p_atten = self.dropout(p_atten)
-        # x dimensions: nbatch * h * seq_len * d_k
-        # print("query shape:", query.shape)
-        # print("key shape:", key.shape)
-        # print("value shape:", value.shape)
-        # print("p_atten shape:", p_atten.shape)
-        x = torch.matmul(p_atten, value)  # filtered values
-        # x now has dimensions:nbatch * seq_len * dim_embed
-        x = x.transpose(1, 2).contiguous().view(nbatch, -1, self.dim_embed)
-        return self.linear(x) # final linear layer
+        # K,V: [B, G, Tk, d_k] (G = num_kv_heads)
+        K = self.WK(x_key).view(B, Tk, self.hk, self.d_k).transpose(1, 2)
+        V = self.WV(x_value).view(B, Tk, self.hk, self.d_k).transpose(1, 2)
+
+        # Broadcast K,V from G groups to H query heads
+        if self.hk != self.hq:
+            reps = self.hq // self.hk
+            K = K.repeat_interleave(reps, dim=1)  # -> [B, H, Tk, d_k]
+            V = V.repeat_interleave(reps, dim=1)  # -> [B, H, Tk, d_k]
+
+        # Attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        if mask is not None:
+            # ensure mask is boolean with True where you want to BLOCK
+            # and broadcastable to [B, 1, Tq, Tk] or [B, 1, 1, Tk]
+            scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
+
+        P = torch.softmax(scores, dim=-1)
+        P = self.dropout(P)
+
+        X = torch.matmul(P, V)                    # [B, H, Tq, d_k]
+        X = X.transpose(1, 2).contiguous().view(B, Tq, self.dim_embed)
+        return self.linear(X)
 
 class ResidualConnection(nn.Module):
     def __init__(self, dim, dropout):
@@ -231,8 +238,8 @@ class DecoderBlock(nn.Module):
     ''' DecoderBlock: self-attention -> position-wise feed-forward (fully connected) layer'''
     def __init__(self, dim_embed, n_heads, dropout, dim_ff):
         super().__init__()
-        self.atten1 = MultiHeadedAttention(n_heads, dim_embed)
-        self.atten2 = MultiHeadedAttention(n_heads, dim_embed)
+        self.atten1 = MultiHeadedAttention(n_heads, dim_embed, num_kv_heads=1)
+        self.atten2 = MultiHeadedAttention(n_heads, dim_embed, num_kv_heads=1)
         self.feed_forward = nn.Sequential(
             nn.Linear(dim_embed, dim_ff),
             nn.ReLU(),
