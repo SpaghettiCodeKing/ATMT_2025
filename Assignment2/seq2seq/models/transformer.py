@@ -179,13 +179,14 @@ class MultiHeadedAttention(nn.Module):
         super(MultiHeadedAttention, self).__init__()
         #super().__init__()  python 3.x
         assert dim_embed % n_heads == 0
+        assert n_heads % num_kv_heads == 0 
+
         self.hq = n_heads                 # query heads (H)
         self.hk = num_kv_heads            # kv heads (G)  -> MQA => 1
         self.d_k = dim_embed // n_heads   # head dim
         self.dim_embed = dim_embed
 
-        self.WQ = nn.Linear(dim_embed, dim_embed)
-
+        self.WQ = nn.Linear(dim_embed, self.hq * self.d_k) # Q project to H*d_k
         # K,V project only to G*d_k (G <= H). For MQA, G=1 so out_dim = d_k
         self.WK = nn.Linear(dim_embed, self.hk * self.d_k)
         self.WV = nn.Linear(dim_embed, self.hk * self.d_k)
@@ -194,14 +195,13 @@ class MultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x_query, x_key, x_value, mask=None):
-        B, Tq = x_query.size(0), x_query.size(1)
-        Tk = x_key.size(1)
+        B = x_query.size(0)
         # Q: [B, H, Tq, d_k]
-        Q = self.WQ(x_query).view(B, Tq, self.hq, self.d_k).transpose(1, 2)
+        Q = self.WQ(x_query).view(B, -1, self.hq, self.d_k).transpose(1, 2)
 
         # K,V: [B, G, Tk, d_k] (G = num_kv_heads)
-        K = self.WK(x_key).view(B, Tk, self.hk, self.d_k).transpose(1, 2)
-        V = self.WV(x_value).view(B, Tk, self.hk, self.d_k).transpose(1, 2)
+        K = self.WK(x_key).view(B, -1, self.hk, self.d_k).transpose(1, 2)
+        V = self.WV(x_value).view(B, -1, self.hk, self.d_k).transpose(1, 2)
 
         # Broadcast K,V from G groups to H query heads
         if self.hk != self.hq:
@@ -221,7 +221,7 @@ class MultiHeadedAttention(nn.Module):
         P = self.dropout(P)
 
         X = torch.matmul(P, V)                    # [B, H, Tq, d_k]
-        X = X.transpose(1, 2).contiguous().view(B, Tq, self.dim_embed)
+        X = X.transpose(1, 2).contiguous().view(B, -1, self.dim_embed)
         return self.linear(X)
 
 class ResidualConnection(nn.Module):
