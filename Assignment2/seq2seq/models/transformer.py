@@ -213,9 +213,13 @@ class MultiHeadedAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         if mask is not None:
-            # ensure mask is boolean with True where you want to BLOCK
-            # and broadcastable to [B, 1, Tq, Tk] or [B, 1, 1, Tk]
-            scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
+            # Expected mask: [B, 1, 1, Tk] or [B, 1, Tq, Tk]
+            if mask.dim() == 2:  # [B, Tk]
+                mask = mask.unsqueeze(1).unsqueeze(2)  # -> [B, 1, 1, Tk]
+            elif mask.dim() == 3:  # [B, Tq, Tk]
+                mask = mask.unsqueeze(1)               # -> [B, 1, Tq, Tk]
+            scores = scores.masked_fill(mask, float('-inf'))
+
 
         P = torch.softmax(scores, dim=-1)
         P = self.dropout(P)
