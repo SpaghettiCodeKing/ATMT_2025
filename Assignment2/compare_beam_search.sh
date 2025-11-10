@@ -27,7 +27,8 @@ python translate.py \
     --checkpoint-path ~/shares/groups/minsky/checkpoint_best.pt\
     --output cz-en/output_beam1.txt \
     --max-len 300 \
-    # --beam-size 1
+    --beam-size 1 \
+    --bleu 
 
 # echo "=== Running translation with beam size 5 ==="
 # python translate.py \
